@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Advanced FCGR Analyzer</title>
+    <link rel="stylesheet" href="style.css">
+    <!-- TensorFlow.js -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest/dist/tf.min.js"></script>
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.min.js"></script> <!-- For scatter plot potential -->
+     <!-- FontAwesome for Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+</head>
+<body>
+    <div class="app-container">
+        <aside class="sidebar">
+            <header class="sidebar-header">
+                <h2><i class="fas fa-sliders-h"></i> Controls</h2>
+            </header>
+
+            <!-- Sequence Input Group -->
+            <div class="config-group">
+                <h3><i class="fas fa-dna"></i> Sequence Input</h3>
+                <div class="form-group input-methods">
+                    <label><input type="radio" name="input-method" value="paste" checked> Paste</label>
+                    <label><input type="radio" name="input-method" value="upload"> Upload</label>
+                    <label><input type="radio" name="input-method" value="url"> URL</label>
+                    <label><input type="radio" name="input-method" value="examples"> Examples</label>
+                </div>
+                <div id="paste-area" class="input-area">
+                    <textarea id="fasta-input" rows="6" placeholder="Paste FASTA sequence(s) here..."></textarea>
+                </div>
+                <div id="upload-area" class="input-area" style="display: none;">
+                    <label for="fasta-file" class="file-label"><i class="fas fa-upload"></i> Choose FASTA File...<input type="file" id="fasta-file" accept=".fasta,.fa,.fna,.txt"></label>
+                    <span id="file-name-display">No file chosen</span>
+                </div>
+                <div id="url-area" class="input-area" style="display: none;">
+                    <input type="url" id="fasta-url" placeholder="Enter URL to FASTA file...">
+                    <small>Note: Fetching may fail due to CORS.</small>
+                </div>
+                <div id="examples-area" class="input-area" style="display: none;">
+                    <select id="example-select">
+                        <option value="">-- Select Example --</option>
+                        <option value="brca1">Human BRCA1 (Coding)</option>
+                        <option value="18s_rrna">Human 18S rRNA</option>
+                        <option value="ecoli_16s">E. coli 16S rRNA</option>
+                        <option value="synthetic">Synthetic Mix (3 seqs)</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- FCGR Parameters Group -->
+            <div class="config-group">
+                 <h3><i class="fas fa-calculator"></i> FCGR Parameters</h3>
+                 <div class="form-group small-input-group">
+                    <div>
+                         <label for="fcgr-k" title="k-mer size (2^k x 2^k matrix)">k:</label>
+                         <input type="number" id="fcgr-k" value="6" min="2" max="8">
+                    </div>
+                     <div>
+                        <label for="max-seq-len" title="Trim sequences longer than this">Max Len:</label>
+                        <input type="number" id="max-seq-len" value="5000" min="100" step="100">
+                    </div>
+                     <div>
+                        <label for="seq-limit" title="Max sequences to process (0=no limit)">Limit:</label>
+                        <input type="number" id="seq-limit" value="10" min="0" step="1">
+                     </div>
+                 </div>
+            </div>
+
+             <!-- Rendering Options Group -->
+             <div class="config-group">
+                 <h3><i class="fas fa-palette"></i> Rendering Options</h3>
+                 <div class="form-group small-input-group">
+                     <div>
+                        <label for="color-map" title="FCGR color scheme">Color Map:</label>
+                        <select id="color-map">
+                            <option value="viridis" selected>Viridis</option>
+                            <option value="grayscale">Grayscale</option>
+                            <option value="plasma">Plasma</option>
+                            <option value="magma">Magma</option>
+                            <option value="inferno">Inferno</option>
+                            <option value="cividis">Cividis</option>
+                        </select>
+                    </div>
+                     <div>
+                        <label for="log-scale-factor" title="Contrast factor for log scaling (0=off)">Log Factor:</label>
+                        <input type="number" id="log-scale-factor" value="1000" min="0" step="100">
+                     </div>
+                 </div>
+                  <div class="form-group">
+                     <label title="Enable/disable anti-aliasing">
+                        <input type="checkbox" id="interpolation-enabled" checked> Image Smoothing
+                    </label>
+                 </div>
+            </div>
+
+             <!-- Classification Model Group -->
+             <div class="config-group">
+                 <h3><i class="fas fa-brain"></i> Classification Model</h3>
+                 <p><small>Upload TF.js format model.</small></p>
+                 <div class="form-group small-input-group">
+                    <label for="model-json" class="file-label small"><i class="fas fa-file-code"></i> model.json<input type="file" id="model-json" accept=".json"></label>
+                    <label for="model-weights" class="file-label small"><i class="fas fa-file-archive"></i> *.bin weights<input type="file" id="model-weights" accept=".bin" multiple></label>
+                 </div>
+                  <div class="form-group">
+                     <label for="class-labels">Class Labels (comma-sep):</label>
+                     <input type="text" id="class-labels" placeholder="e.g., Coding,rRNA,Other">
+                 </div>
+                 <div id="model-status">Model not loaded.</div>
+            </div>
+
+            <!-- Action Button & Status -->
+            <button id="process-btn"><i class="fas fa-play"></i> Process Sequences</button>
+            <div id="processing-status">Ready</div>
+            <div class="progress-bar-container">
+                 <div class="progress-bar" id="progress-bar" style="width: 0%;"></div>
+             </div>
+        </aside>
+
+        <main class="main-content">
+            <header class="main-header">
+                <h1>FCGR Analysis Results</h1>
+            </header>
+
+            <!-- Tab Navigation -->
+            <div class="tab-container">
+                <button class="tab-button active" onclick="openTab(event, 'tab-sequences')"><i class="fas fa-list-ol"></i> Sequence Details</button>
+                <button class="tab-button" onclick="openTab(event, 'tab-aggregate')"><i class="fas fa-chart-bar"></i> Aggregate Plots</button>
+            </div>
+
+            <!-- Tab Content -->
+            <div id="tab-sequences" class="tab-content active-content">
+                <section id="results-section" class="card no-margin">
+                    <h2><i class="fas fa-dna"></i> Individual Sequence Analysis</h2>
+                    <div id="results-container">
+                        <p>Input sequences in the sidebar and click "Process Sequences". Results for each sequence will appear here.</p>
+                    </div>
+                </section>
+            </div>
+
+            <div id="tab-aggregate" class="tab-content">
+                <section id="summary-plots-section" class="card no-margin">
+                    <h2><i class="fas fa-chart-pie"></i> Aggregate Metrics Visualization</h2>
+                     <div id="summary-plots-controls">
+                         <label for="aggregate-chart-type">Chart Type:</label>
+                         <select id="aggregate-chart-type">
+                             <option value="bar_mean_stddev">Mean +/- Std Dev (Bar)</option>
+                             <option value="scatter">Scatter Plot (Mean vs Entropy)</option>
+                             <!-- Add more plot types later if needed -->
+                         </select>
+                     </div>
+                    <div id="summary-plots-container">
+                        <p>Process sequences to generate summary plots.</p>
+                        <!-- Chart canvases will be added here -->
+                    </div>
+                </section>
+            </div>
+        </main>
+    </div>
+
+    <!-- Tooltip Element -->
+    <div id="tooltip" class="tooltip"></div>
+
+    <!-- Web Worker and Main Script -->
+    <script src="script.js"></script>
+</body>
+</html>

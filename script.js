@@ -1,0 +1,827 @@
+// --- DOM Elements ---
+const kInput = document.getElementById('fcgr-k');
+const maxSeqLenInput = document.getElementById('max-seq-len');
+const seqLimitInput = document.getElementById('seq-limit');
+const colorMapSelect = document.getElementById('color-map');
+const logScaleFactorInput = document.getElementById('log-scale-factor');
+const interpolationEnabledCheckbox = document.getElementById('interpolation-enabled');
+const inputMethodRadios = document.querySelectorAll('input[name="input-method"]');
+const pasteArea = document.getElementById('paste-area');
+const uploadArea = document.getElementById('upload-area');
+const urlArea = document.getElementById('url-area');
+const examplesArea = document.getElementById('examples-area');
+const fastaInput = document.getElementById('fasta-input');
+const fastaFile = document.getElementById('fasta-file');
+const fileNameDisplay = document.getElementById('file-name-display');
+const fastaUrl = document.getElementById('fasta-url');
+const exampleSelect = document.getElementById('example-select');
+const processBtn = document.getElementById('process-btn');
+const processingStatus = document.getElementById('processing-status');
+const progressBarContainer = document.querySelector('.progress-bar-container');
+const progressBar = document.getElementById('progress-bar');
+const modelJsonInput = document.getElementById('model-json');
+const modelWeightsInput = document.getElementById('model-weights');
+const modelStatus = document.getElementById('model-status');
+const classLabelsInput = document.getElementById('class-labels');
+const resultsContainer = document.getElementById('results-container');
+const summaryPlotsContainer = document.getElementById('summary-plots-container');
+const aggregateChartTypeSelect = document.getElementById('aggregate-chart-type');
+const tooltip = document.getElementById('tooltip');
+
+// --- Global State ---
+let model = null;
+let classLabels = [];
+let busy = false;
+let chartInstances = {}; // To hold Chart.js instances (both aggregate and individual radar)
+let aggregateMetricsData = []; // Store successful results for aggregate plots
+let processingQueue = []; // Track sequences being processed by worker
+let worker = null; // Initialize worker variable
+
+// --- Color Maps ---
+const colorMaps = {
+    viridis: [[68,1,84],[70,50,127],[54,92,141],[39,127,142],[31,161,135],[74,193,109],[160,218,57],[253,231,37]],
+    plasma: [[13,8,135],[84,2,163],[140,39,141],[185,75,104],[219,111,71],[244,154,38],[253,201,3],[240,249,33]],
+    magma: [[0,0,4],[30,18,94],[84,31,112],[132,59,105],[181,89,84],[226,128,63],[251,175,44],[252,234,104]],
+    inferno: [[0,0,4],[39,12,100],[100,25,127],[158,49,114],[212,82,85],[249,130,52],[249,188,4],[251,252,14]],
+    cividis: [[0,33,71],[48,77,104],[102,120,120],[155,165,128],[206,211,134],[240,239,146],[255,255,160],[255,255,204]]
+    // grayscale handled separately
+};
+
+function interpolateColor(colors, value) {
+    if (!Array.isArray(colors) || colors.length < 2) {
+        const intensity = Math.round(Math.max(0, Math.min(1, value)) * 255);
+        return `rgb(${intensity},${intensity},${intensity})`;
+    }
+    value = Math.max(0, Math.min(1, value));
+    const scaledValue = value * (colors.length - 1);
+    const index1 = Math.floor(scaledValue);
+    const index2 = Math.min(colors.length - 1, index1 + 1);
+    const weight2 = scaledValue - index1;
+    const weight1 = 1 - weight2;
+
+    const r = Math.round(colors[index1][0] * weight1 + colors[index2][0] * weight2);
+    const g = Math.round(colors[index1][1] * weight1 + colors[index2][1] * weight2);
+    const b = Math.round(colors[index1][2] * weight1 + colors[index2][2] * weight2);
+    return `rgb(${r},${g},${b})`;
+}
+
+// --- Web Worker Initialization ---
+function initializeWorker() {
+    if (window.Worker) {
+        console.log("Initializing Web Worker...");
+        // Terminate existing worker if it exists
+        if(worker) {
+            worker.terminate();
+            console.log("Terminated existing worker.");
+        }
+        worker = new Worker('fcgr_worker.js');
+
+        worker.onmessage = function(e) {
+            const workerResult = e.data;
+            // console.log(`Main: Received result from worker for ID: ${workerResult.id}`);
+
+            const queueIndex = processingQueue.findIndex(item => item.id === workerResult.id);
+            if (queueIndex === -1) {
+                console.warn("Received worker result for unknown ID:", workerResult.id);
+                return;
+            }
+            const queueItem = processingQueue.splice(queueIndex, 1)[0];
+
+            const finalResult = {
+                ...queueItem,
+                fcgrMatrix: workerResult.fcgrMatrix,
+                metrics: workerResult.metrics,
+                error: workerResult.error,
+                classification: { label: 'N/A', probability: 'N/A' }
+            };
+
+            // Run inference on main thread if needed
+            if (model && classLabels.length > 0 && !finalResult.error && finalResult.fcgrMatrix) {
+                 runInference(finalResult.fcgrMatrix, finalResult.dim).then(classificationResult => {
+                    finalResult.classification = classificationResult;
+                    displayResult(finalResult);
+                    if (!finalResult.error) aggregateMetricsData.push(finalResult);
+                 }).catch(infError => {
+                     console.error(`Inference error for ${finalResult.id}:`, infError);
+                     finalResult.classification.label = 'Inference Error';
+                     displayResult(finalResult);
+                     if (!finalResult.error) aggregateMetricsData.push(finalResult);
+                 });
+            } else {
+                displayResult(finalResult);
+                if (!finalResult.error && finalResult.fcgrMatrix) aggregateMetricsData.push(finalResult);
+            }
+
+            // Update progress
+            const total = queueItem.totalCount;
+            const completed = total - processingQueue.length;
+            const progress = 20 + Math.round((completed / total) * 70);
+            updateProgress(progress, `Processed ${completed}/${total}...`);
+
+            checkProcessingComplete(total);
+        };
+
+        worker.onerror = function(error) {
+            console.error("Web Worker Error:", error);
+            setBusy(false, `Worker error: ${error.message}. Processing stopped.`);
+            processingQueue = [];
+        };
+    } else {
+        console.warn("Web Workers not supported in this browser. Processing may be slow.");
+        alert("Web Workers are not supported in your browser. Calculations will run on the main page, which might cause temporary freezes.");
+    }
+}
+
+
+// --- Event Listeners ---
+inputMethodRadios.forEach(radio => {
+    radio.addEventListener('change', () => {
+        pasteArea.style.display = radio.value === 'paste' ? 'block' : 'none';
+        uploadArea.style.display = radio.value === 'upload' ? 'block' : 'none';
+        urlArea.style.display = radio.value === 'url' ? 'block' : 'none';
+        examplesArea.style.display = radio.value === 'examples' ? 'block' : 'none';
+        if (radio.value !== 'upload') {
+            fileNameDisplay.textContent = 'No file chosen';
+            fastaFile.value = ''; // Clear file input if switching away
+        }
+    });
+});
+
+fastaFile.addEventListener('change', () => {
+    fileNameDisplay.textContent = fastaFile.files.length > 0 ? fastaFile.files[0].name : 'No file chosen';
+});
+
+processBtn.addEventListener('click', handleProcessButtonClick);
+modelJsonInput.addEventListener('change', loadModel);
+modelWeightsInput.addEventListener('change', loadModel);
+classLabelsInput.addEventListener('change', loadModel); // Re-validate labels if they change
+aggregateChartTypeSelect.addEventListener('change', () => {
+    plotAggregateMetrics(aggregateMetricsData);
+});
+
+
+// --- Core Functions ---
+function setBusy(isBusy, message = 'Ready') {
+    busy = isBusy;
+    processBtn.disabled = isBusy;
+    processBtn.innerHTML = isBusy ? `${message} <span class="spinner"></span>` : '<i class="fas fa-play"></i> Process Sequences';
+    processingStatus.textContent = message;
+    progressBarContainer.classList.toggle('visible', isBusy);
+    updateProgress(0);
+}
+
+function updateProgress(percentage, message = null) {
+     progressBar.style.width = `${Math.max(0, Math.min(100, percentage))}%`;
+     if (message) {
+         processingStatus.textContent = message;
+     }
+}
+
+async function handleProcessButtonClick() {
+    if (busy) return;
+    if (!worker) { // Ensure worker is initialized
+        initializeWorker();
+        if (!worker) {
+           processingStatus.textContent = 'Error: Web Workers unavailable.';
+           return;
+        }
+    }
+    setBusy(true, 'Initializing...');
+    resultsContainer.innerHTML = '<p>Processing...</p>';
+    summaryPlotsContainer.innerHTML = '<p>Processing...</p>';
+    destroyCharts();
+    aggregateMetricsData = [];
+    processingQueue = [];
+
+    const startTime = performance.now();
+
+    try {
+        let fastaContent = '';
+        const selectedMethod = document.querySelector('input[name="input-method"]:checked').value;
+        updateProgress(5, 'Reading input...');
+
+        if (selectedMethod === 'paste') fastaContent = fastaInput.value;
+        else if (selectedMethod === 'upload') { if (!fastaFile.files.length) throw new Error("Please select a FASTA file."); fastaContent = await readFileContent(fastaFile.files[0]); }
+        else if (selectedMethod === 'url') { const url = fastaUrl.value.trim(); if (!url) throw new Error("Please enter a URL."); updateProgress(10, `Fetching from URL...`); fastaContent = await fetchUrlContent(url); }
+        else if (selectedMethod === 'examples') { const exampleKey = exampleSelect.value; if (!exampleKey) throw new Error("Please select an example."); fastaContent = getExampleFasta(exampleKey); }
+        if (!fastaContent || fastaContent.trim() === '') throw new Error("No FASTA content provided or loaded.");
+
+        updateProgress(20, 'Parsing FASTA...');
+        let sequences = parseFasta(fastaContent);
+        if (sequences.length === 0) throw new Error("No valid sequences found.");
+
+        const sequenceLimit = parseInt(seqLimitInput.value, 10);
+        if (sequenceLimit > 0 && sequences.length > sequenceLimit) {
+            console.warn(`Processing limited to first ${sequenceLimit} sequences.`);
+            sequences = sequences.slice(0, sequenceLimit);
+        }
+        const totalToProcess = sequences.length;
+        resultsContainer.innerHTML = ''; // Clear "Processing..." message
+
+        const k = parseInt(kInput.value, 10);
+        const maxLen = parseInt(maxSeqLenInput.value, 10);
+        const dim = 1 << k;
+
+        if (totalToProcess === 0) {
+            throw new Error("No sequences selected for processing.");
+        }
+
+        // Send sequences to Worker
+        for (let i = 0; i < totalToProcess; i++) {
+            const seqData = sequences[i];
+            const cleanedSeq = cleanSequence(seqData.sequence);
+            const finalSeq = cleanedSeq.length > maxLen ? cleanedSeq.substring(0, maxLen) : cleanedSeq;
+
+            if (finalSeq.length < k) {
+                 console.warn(`Sequence ${seqData.id} too short (${finalSeq.length} < k=${k}) after cleaning/trimming. Skipping.`);
+                 // Need to track skipped items for progress? Or adjust totalToProcess?
+                 // Let's just display an error message for it later
+                 displayResult({ id: seqData.id, error: `Sequence too short after cleaning/trimming (${finalSeq.length} < k=${k}).`, originalLength: seqData.sequence.length, processedLength: finalSeq.length });
+                 // Need to adjust the 'total' count used by checkProcessingComplete if we skip here before queuing
+                 // Simpler approach: queue it, let worker return error if still too short?
+                 // For now, let's queue and let worker handle final check.
+            }
+
+            const queueItem = {
+                 id: seqData.id, k: k, dim: dim,
+                 originalLength: seqData.sequence.length,
+                 processedLength: finalSeq.length,
+                 totalCount: totalToProcess
+            };
+            processingQueue.push(queueItem);
+
+            worker.postMessage({
+                id: seqData.id, sequence: finalSeq, k: k, dim: dim
+            });
+             updateProgress(20 + Math.round((i / totalToProcess) * 5), `Sending job ${i + 1}/${totalToProcess}...`);
+        }
+        // If processingQueue is empty after loop (all skipped), manually finalize.
+        if(processingQueue.length === 0 && totalToProcess > 0) {
+             checkProcessingComplete(totalToProcess);
+        }
+
+
+    } catch (error) {
+        console.error("Processing Setup Error:", error);
+        resultsContainer.innerHTML = '';
+        summaryPlotsContainer.innerHTML = '';
+        setBusy(false, `Error: ${error.message}`);
+    }
+}
+
+function checkProcessingComplete(total) {
+    if (processingQueue.length === 0) {
+        console.log("All worker jobs completed or skipped.");
+        updateProgress(95, 'Generating summary plots...');
+        // Plot aggregate data *after* all results are in
+        plotAggregateMetrics(aggregateMetricsData);
+        updateProgress(100);
+        // Calculate duration based on total successful items?
+        setBusy(false, `Finished processing ${aggregateMetricsData.length} / ${total} sequences.`);
+    }
+}
+
+// --- Input Handling Functions ---
+function readFileContent(file) { return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = (event) => resolve(event.target.result); reader.onerror = (error) => reject(error); reader.readAsText(file); }); }
+async function fetchUrlContent(url) { try { const response = await fetch(url); if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`); return await response.text(); } catch (error) { console.error("Fetch error:", error); throw new Error(`Failed to fetch from URL: ${error.message}. Check URL and CORS policy.`); } }
+function getExampleFasta(key) { const examples = { brca1: `>NM_007294.4 Homo sapiens BRCA1, DNA repair associated (BRCA1), transcript variant 1, mRNA\nAGCTTTCTGAGAGGCTTCTCTTAGAGTCTTCTCTGTGTGTGTGTCTCTCTCTCTCTCTCTCTCTCTCTGTTCA... (use full sequence for real analysis)`, '18s_rrna': `>NR_145820.1 Homo sapiens 18S ribosomal RNA (RNA18S5), ribosomal RNA\nNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN... (use full sequence for real analysis)`, 'ecoli_16s': `>NC_000913.3:c4152970-4151428 Escherichia coli str. K-12 substr. MG1655, complete genome\nAAATTGAAGAGTTTGATCATGGCTCAGATTGAACGCTGGCGGCAGGCCTAACACATGCAAGTCGAACGGTAACAGGAAGCAGCTTGCTGCTTCGCTGACGAGTGGCGGACGGGTGAGTAATGTCTGGGAAACTGCCTGATGGAGGGGGATAACTACTGGAAACGGTAGCTAATACCGCATAACGTCGCAAGACCAAAGAGGGGGACCTTCGGGCCTCTTGCCATCGGATGTGCCCAGATGGGATTAGCTAGTAGGTGGGGTAACGGCTCACCTAGGCGACGATCCCTAGCTGGTCTGAGAGGATGACCAGCCACACTGGAACTGAGACACGGTCCAGACTCCTACGGGAGGCAGCAGTGGGGAATATTGCACAATGGGCGCAAGCCTGATGCAGCCATGCCGCGTGTATGAAGAAGGCCTTCGGGTTGTAAAGTACTTTCAGCGGGGAGGAAGGGAGTAAAGTTAATACCTTTGCTCATTGACGTTACCCGCAGAAGAAGCACCGGCTAACTCCGTGCCAGCAGCCGCGGTAATACGGAGGGTGCAAGCGTTAATCGGAATTACTGGGCGTAAAGCGCACGCAGGCGGTTTGTTAAGTCAGATGTGAAATCCCCGGGCTCAACCTGGGAACTGCATCTGATACTGGCAGGCTTGAGTCTCGTAGAGGGGGGTAGAATTCCAGGTGTAGCGGTGAAATGCGTAGAGATCTGGAGGAATACCGGTGGCGAAGGCGGCCCCCTGGACGAAGACTGACGCTCAGGTGCGAAAGCGTGGGGAGCAAACAGGATTAGATACCCTGGTAGTCCACGCCGTAAACGATGTCGACTTGGAGGTTGTGCCCTTGAGGCGTGGCTTCCGGAGCTAACGCGTTAAGTCGACCGCCTGGGGAGTACGGCCGCAAGGTTAAAACTCAAATGAATTGACGGGGGCCCGCACAAGCGGTGGAGCATGTGGTTTAATTCGATGCAACGCGAAGAACCTTACCTGGTCTTGACATCCACGGAAGTTTTCAGAGATGAGAATGTGCCTTCGGGAACCGTGAGACAGGTGCTGCATGGCTGTCGTCAGCTCGTGTTGTGAAATGTTGGGTTAAGTCCCGCAACGAGCGCAACCCTTATCCTTTGTTGCCAGCGGTCCGGCCGGGAACTCAAAGGAGACTGCCAGTGATAAACTGGAGGAAGGTGGGGATGACGTCAAGTCATCATGGCCCTTACGACCAGGGCTACACACGTGCTACAATGGCGCATACAAAGAGAAGCGACCTCGCGAGAGCAAGCGGACCTCATAAAGTGCGTCGTAGTCCGGATTGGAGTCTGCAACTCGACTCCATGAAGTCGGAATCGCTAGTAATCGTGGATCAGAATGCCACGGTGAATACGTTCCCGGGCCTTGTACACACCGCCCGTCACACCATGGGAGTGGGTTGCAAAAGAAGTAGGTAGCTTAACCTTCGGGAGGGCGCTTACCACTTTGTGATTCATGACTGGGGTGAAGTCGTAACAAGGTAACCGTAGGGGAACCTGCGGTTGGATCACCTCCTTA`, synthetic: `>Synth1_Coding_like\nATGAAACGCATTAGCACCACCATTACCACCACCATCACCATTACCACAGGTAACGGTGCGGGCTGACGCGTACACGAAAGCGTACGGCAGGCGTATCAGACCGGCTGGTAAAAACCCTGTGGAACACCTACGTCACCCTTAGCACCCCTAAACAAAAAGATTAACATCGCATCAGGAATTACGACGAATGCCCCCACGCTATAATCACGCGTACTGT\n>Synth2_AT_rich\n${'A'.repeat(200)}${'T'.repeat(200)}${'AT'.repeat(100)}\n>Synth3_GC_rich\n${'G'.repeat(200)}${'C'.repeat(200)}${'GC'.repeat(100)}` }; return examples[key] || ''; }
+function parseFasta(fastaContent) { const sequences = []; const lines = fastaContent.split(/\r?\n/); let currentId = null; let currentSeq = ''; for (const line of lines) { const trimmedLine = line.trim(); if (trimmedLine.startsWith('>')) { if (currentId) sequences.push({ id: currentId, sequence: currentSeq }); currentId = trimmedLine.substring(1).trim() || 'Unnamed Sequence'; currentSeq = ''; } else if (currentId && trimmedLine.length > 0 && !trimmedLine.startsWith(';')) currentSeq += trimmedLine.replace(/\s/g, ''); } if (currentId) sequences.push({ id: currentId, sequence: currentSeq }); return sequences; }
+function cleanSequence(sequence) { return sequence.toUpperCase().replace(/[^ATGC]/g, ''); }
+
+// --- FCGR Drawing ---
+function drawFCGR(fcgrMatrix, k, canvas) {
+    const dim = 1 << k;
+    if (!canvas) { console.error("DrawFCGR: Canvas element not provided"); return; }
+    const displayCtx = canvas.getContext('2d');
+    if (!displayCtx) { console.error("DrawFCGR: Could not get 2D context"); return; }
+
+    const useSmoothing = interpolationEnabledCheckbox.checked;
+    const logScaleFactor = parseFloat(logScaleFactorInput.value);
+
+    const internalCanvas = document.createElement('canvas');
+    internalCanvas.width = dim; internalCanvas.height = dim;
+    const internalCtx = internalCanvas.getContext('2d');
+    if (!internalCtx) { console.error("DrawFCGR: Could not get internal 2D context"); return; }
+
+    const imageData = internalCtx.createImageData(dim, dim);
+    const data = imageData.data;
+    let maxLogVal = 0;
+    const useLogScale = logScaleFactor > 0;
+    const epsilon = 1e-9;
+
+    // Pre-calculate display values (log or linear) and find max
+    const displayValues = new Float32Array(fcgrMatrix.length);
+    for(let i = 0; i < fcgrMatrix.length; i++) {
+        const val = fcgrMatrix[i];
+        displayValues[i] = useLogScale ? Math.log1p(val * logScaleFactor) : val;
+        if (displayValues[i] > maxLogVal) maxLogVal = displayValues[i];
+    }
+    maxLogVal = maxLogVal > epsilon ? maxLogVal : 1; // Avoid division by zero
+
+    const selectedColorMap = colorMapSelect.value;
+    const colors = selectedColorMap === 'grayscale' ? null : colorMaps[selectedColorMap] || colorMaps.viridis;
+
+    for (let y = 0; y < dim; y++) {
+        for (let x = 0; x < dim; x++) {
+            const matrixIndex = y * dim + x;
+            const normalizedValue = displayValues[matrixIndex] / maxLogVal;
+            let r, g, b;
+            if (!colors) { const intensity = Math.round(normalizedValue * 255); r = g = b = intensity; }
+            else { const color = interpolateColor(colors, normalizedValue); const match = color.match(/rgb\((\d+),(\d+),(\d+)\)/); if (match) { r = parseInt(match[1], 10); g = parseInt(match[2], 10); b = parseInt(match[3], 10); } else { r = g = b = 0; } } // Fallback black if color fails
+
+            const pixelIndex = (y * dim + x) * 4;
+            data[pixelIndex] = r; data[pixelIndex + 1] = g; data[pixelIndex + 2] = b; data[pixelIndex + 3] = 255;
+        }
+    }
+    internalCtx.putImageData(imageData, 0, 0);
+
+    displayCtx.imageSmoothingEnabled = useSmoothing;
+    displayCtx.clearRect(0, 0, canvas.width, canvas.height);
+    displayCtx.drawImage(internalCanvas, 0, 0, dim, dim, 0, 0, canvas.width, canvas.height);
+
+    canvas.matrixData = { fcgrMatrix, k, dim }; // Store minimal data needed for tooltip
+}
+
+// --- Tooltip Logic ---
+function showTooltip(event) {
+    const canvas = event.target;
+    if (!canvas.matrixData || !canvas.matrixData.fcgrMatrix) return;
+    const rect = canvas.getBoundingClientRect();
+    const displayX = event.clientX - rect.left;
+    const displayY = event.clientY - rect.top;
+    const scaleX = canvas.width / canvas.matrixData.dim;
+    const scaleY = canvas.height / canvas.matrixData.dim;
+    const internalX = Math.floor(displayX / scaleX);
+    const internalY = Math.floor(displayY / scaleY);
+
+    if (internalX >= 0 && internalX < canvas.matrixData.dim && internalY >= 0 && internalY < canvas.matrixData.dim) {
+        const matrixIndex = internalY * canvas.matrixData.dim + internalX;
+        const frequency = canvas.matrixData.fcgrMatrix[matrixIndex];
+        tooltip.style.left = `${event.pageX + 15}px`;
+        tooltip.style.top = `${event.pageY + 15}px`;
+        tooltip.innerHTML = `(${internalX}, ${internalY})<br>${frequency.toExponential(3)}`; // Short format
+        tooltip.style.opacity = 1;
+    } else {
+        hideTooltip();
+    }
+}
+function hideTooltip() { tooltip.style.opacity = 0; }
+
+// --- Model Loading & Inference ---
+async function loadModel() {
+    const jsonFile = modelJsonInput.files ? modelJsonInput.files[0] : null;
+    const weightFiles = modelWeightsInput.files ? modelWeightsInput.files : null;
+
+    if (!jsonFile || !weightFiles || weightFiles.length === 0) {
+        // Don't reset status if only labels change - allow label update
+        if(model && modelStatus.textContent.startsWith("Model loaded")) {
+            updateLabels(); // Update labels without reloading model
+        } else {
+             modelStatus.textContent = 'Model not loaded (JSON & weights needed).';
+             model = null;
+             classLabels = [];
+        }
+        return;
+    }
+
+    modelStatus.innerHTML = 'Loading model... <span class="spinner"></span>';
+    try {
+        const allFiles = [jsonFile, ...Array.from(weightFiles)];
+        model = await tf.loadLayersModel(tf.io.browserFiles(allFiles));
+        modelStatus.textContent = `Model loaded: ${model.name || 'Unnamed'}`;
+        console.log("Model loaded:", model);
+        updateLabels(); // Parse and validate labels after successful load
+
+    } catch (error) {
+        console.error("Model loading failed:", error);
+        modelStatus.textContent = `Error loading model: ${error.message}`;
+        model = null;
+        classLabels = [];
+    }
+}
+
+function updateLabels() {
+     const labelsStr = classLabelsInput.value.trim();
+     if (labelsStr) {
+         classLabels = labelsStr.split(',').map(s => s.trim()).filter(s => s);
+         console.log("Using class labels:", classLabels);
+         if (model && model.layers) { // Check if model is loaded before accessing layers
+             try {
+                 const outputUnits = model.layers[model.layers.length - 1].outputShape[1];
+                 if (outputUnits !== classLabels.length) {
+                     console.warn(`Mismatch: Model output units (${outputUnits}) vs labels (${classLabels.length}).`);
+                     modelStatus.textContent += " (Warn: Label count mismatch)";
+                 } else {
+                      modelStatus.textContent += ` (${classLabels.length} classes)`; // Confirm label count
+                 }
+             } catch(e){console.warn("Could not verify model output units.")}
+         } else {
+             modelStatus.textContent += ` (${classLabels.length} labels provided)`;
+         }
+     } else {
+         classLabels = [];
+         console.warn("Class labels not provided.");
+         if (model) modelStatus.textContent += " (Class labels missing)";
+     }
+}
+
+
+async function runInference(fcgrMatrix, dim) {
+    if (!model) return { label: 'Model N/A', probability: '' };
+    let predictedLabel = 'Error'; let probability = 'N/A';
+    let tensor = null; let prediction = null;
+    try {
+        tensor = tf.tensor(fcgrMatrix, [1, dim, dim, 1], 'float32');
+        prediction = model.predict(tensor);
+        const probabilities = await prediction.data();
+        const predictedIndex = tf.argMax(prediction, axis=1).dataSync()[0];
+        probability = probabilities[predictedIndex].toFixed(4);
+        if (predictedIndex < classLabels.length) {
+            predictedLabel = classLabels[predictedIndex];
+        } else {
+            predictedLabel = `Index ${predictedIndex} (Label missing)`;
+        }
+    } catch(error) {
+         console.error("Inference error:", error);
+         predictedLabel = 'Inference Error'; probability = 'N/A';
+    } finally {
+        // Ensure tensors are disposed
+        if (tensor) tensor.dispose();
+        if (prediction) prediction.dispose();
+    }
+    return { label: predictedLabel, probability: probability };
+}
+
+
+// --- Display Results ---
+function displayResult(result) {
+    const itemDiv = document.createElement('div');
+    itemDiv.classList.add('result-item');
+    itemDiv.id = `result-${result.id.replace(/[^a-zA-Z0-9]/g, '_')}`; // Create unique ID
+
+    const title = document.createElement('h3');
+    title.textContent = result.id;
+    itemDiv.appendChild(title);
+
+    const lengthInfo = document.createElement('p');
+    lengthInfo.innerHTML = `<small>Orig Len: ${result.originalLength}, Proc Len: ${result.processedLength}</small>`;
+    itemDiv.appendChild(lengthInfo);
+
+    if (result.error) {
+        const errorMsg = document.createElement('p');
+        errorMsg.style.color = '#e74c3c'; errorMsg.style.fontWeight = 'bold';
+        errorMsg.textContent = `Error: ${result.error}`;
+        itemDiv.appendChild(errorMsg);
+    } else if (!result.fcgrMatrix) {
+         const errorMsg = document.createElement('p');
+         errorMsg.style.color = '#e74c3c'; errorMsg.style.fontWeight = 'bold';
+         errorMsg.textContent = `Error: FCGR matrix missing.`;
+         itemDiv.appendChild(errorMsg);
+    }
+     else {
+        // FCGR Canvas
+        const canvasContainer = document.createElement('div');
+        canvasContainer.classList.add('fcgr-canvas-container');
+        const canvas = document.createElement('canvas');
+        canvas.classList.add('fcgr-canvas'); canvas.width = 256; canvas.height = 256;
+        canvasContainer.appendChild(canvas);
+        itemDiv.appendChild(canvasContainer);
+        canvas.addEventListener('mousemove', showTooltip);
+        canvas.addEventListener('mouseleave', hideTooltip);
+
+        // Radar Chart
+        const radarContainer = document.createElement('div');
+        radarContainer.classList.add('radar-chart-container');
+        const radarCanvas = document.createElement('canvas');
+        radarCanvas.classList.add('radar-chart-canvas');
+        radarContainer.appendChild(radarCanvas);
+        itemDiv.appendChild(radarContainer);
+
+        // Metrics Table
+        const table = document.createElement('table');
+        table.classList.add('metrics-table');
+        const tbody = document.createElement('tbody');
+        if(result.metrics) {
+            for (const [key, value] of Object.entries(result.metrics)) {
+                const row = tbody.insertRow();
+                // Improve key formatting
+                let formattedKey = key.replace(/([A-Z])/g, ' $1').replace(/^./, str => str.toUpperCase());
+                if (key.startsWith('hu')) formattedKey = `Hu Moment ${key.substring(2)}`;
+                formattedKey = formattedKey.replace('Asm', 'ASM');
+                row.insertCell().textContent = formattedKey;
+                row.insertCell().textContent = typeof value === 'number' ? value.toFixed(5) : value;
+            }
+        }
+        table.appendChild(tbody);
+        itemDiv.appendChild(table);
+
+        // Classification
+        const classDiv = document.createElement('div');
+        classDiv.classList.add('classification-result');
+        classDiv.innerHTML = `Classification: <span class="label">${result.classification.label}</span> (Prob: ${result.classification.probability})`;
+        itemDiv.appendChild(classDiv);
+
+        // Defer drawing until element is in DOM
+         requestAnimationFrame(() => {
+             try {
+                 if(result.fcgrMatrix) drawFCGR(result.fcgrMatrix, result.k, canvas);
+                 canvas.classList.toggle('smooth', interpolationEnabledCheckbox.checked);
+                 if(result.metrics) plotSequenceRadarChart(result.metrics, radarCanvas, result.id); // Pass ID for chart instance
+             } catch (drawError) {
+                 console.error("Error drawing visuals for " + result.id + ":", drawError);
+                 canvasContainer.innerHTML = `<p style="color:red;">Draw Error</p>`;
+                 radarContainer.innerHTML = `<p style="color:red;">Draw Error</p>`;
+             }
+         });
+    }
+    resultsContainer.appendChild(itemDiv);
+}
+
+// --- Radar Chart Plotting ---
+function plotSequenceRadarChart(metrics, canvas, instanceKey) {
+    // Destroy previous chart for this canvas if it exists
+    const chartKey = `radar_${instanceKey}`; // Unique key for radar charts
+    if (chartInstances[chartKey] && typeof chartInstances[chartKey].destroy === 'function') {
+        chartInstances[chartKey].destroy();
+    }
+
+    // Define which metrics to include and their order
+    const radarMetricKeys = [
+        // Basic
+        'mean', 'variance', 'entropy', 'skewness', 'kurtosis',
+        // Haralick
+        'homogeneity', 'contrast', 'correlation', 'energy', 'dissimilarity', 'asm',
+        // Hu (First few might be most informative)
+        'hu0', 'hu1', 'hu2', 'hu3', 'fractalDimension'
+    ];
+
+    // Create labels based on the selected keys, formatted nicely
+    const labels = radarMetricKeys.map(key => {
+        let formattedKey = key.replace(/([A-Z])/g, ' $1').replace(/^./, str => str.toUpperCase());
+        if (key.startsWith('hu')) formattedKey = `Hu ${key.substring(2)}`;
+        formattedKey = formattedKey.replace('Asm', 'ASM');
+        return formattedKey;
+    });
+
+    // Extract values and apply normalization
+    const dataValues = radarMetricKeys.map(key => {
+        const v = metrics[key]; // Get the original metric value using the key
+
+        // Improved normalization: Map to [0, 1] based on expected ranges or data-driven stats
+        // This still requires refinement based on actual data distributions.
+        if (typeof v !== 'number' || !isFinite(v)) return 0.5; // Default for non-numeric
+
+        let scaledV = 0.5; // Default fallback value
+        switch(key) {
+            case 'mean':
+            case 'variance': // Often very small
+                scaledV = Math.min(1, Math.max(0, v * 100)); // Scale up, cap at 1
+                break;
+            case 'entropy': // Typically 0 to log2(N), where N is number of states. For FCGR N=dim*dim. k=6 -> N=4096, max entropy ~12. Scale to 0-1.
+                scaledV = Math.min(1, Math.max(0, v / 12));
+                break;
+            case 'skewness': // Often around -3 to +3
+                scaledV = Math.min(1, Math.max(0, (v + 3) / 6));
+                break;
+            case 'kurtosis': // Fisher: Often around -3 to +10 (or more)
+                scaledV = Math.min(1, Math.max(0, (v + 3) / 15)); // Wider range map
+                break;
+            case 'homogeneity':
+            case 'energy':
+            case 'asm': // These are typically 0 to 1
+                scaledV = Math.max(0, Math.min(1, v));
+                break;
+            case 'contrast':
+            case 'dissimilarity': // Can grow large, use log scale
+                 scaledV = Math.min(1, Math.max(0, Math.log1p(v) / Math.log1p(100))); // Scale based on log, adjust 100 if needed
+                break;
+            case 'correlation': // Typically -1 to 1
+                scaledV = (v + 1) / 2;
+                break;
+            case 'hu0': scaledV = Math.min(1, Math.max(0, v / 10)); break; // Rough scaling, adjust based on observation
+            case 'hu1': scaledV = Math.min(1, Math.max(0, v / 20)); break; // Rough scaling
+            case 'hu2': scaledV = Math.min(1, Math.max(0, v / 30)); break; // Rough scaling
+            case 'hu3': scaledV = Math.min(1, Math.max(0, v / 30)); break; // Rough scaling
+            case 'fractalDimension':
+                scaledV = Math.min(1, Math.max(0, v / 2));
+                break;
+            // Add cases for hu4, hu5, hu6 if included
+            default:
+                 scaledV = Math.max(0, Math.min(1, (v + 1) / 2)); // Generic fallback
+                 break;
+        }
+        return scaledV;
+    });
+
+     if (!canvas) { console.error("plotSequenceRadarChart: Canvas element not provided for", instanceKey); return; }
+     const ctx = canvas.getContext('2d');
+     if (!ctx) { console.error("plotSequenceRadarChart: Could not get 2D context for", instanceKey); return; }
+
+     chartInstances[chartKey] = new Chart(ctx, {
+        type: 'radar',
+        data: {
+            labels: labels, // Use formatted labels
+            datasets: [{
+                label: 'Normalized Metrics',
+                data: dataValues, // Use normalized values
+                fill: true,
+                backgroundColor: 'rgba(52, 152, 219, 0.3)', // More transparent fill
+                borderColor: 'rgb(41, 128, 185)', // Slightly darker border
+                pointBackgroundColor: 'rgb(41, 128, 185)',
+                pointBorderColor: '#fff',
+                pointHoverBackgroundColor: '#fff',
+                pointHoverBorderColor: 'rgb(41, 128, 185)',
+                borderWidth: 1.5, // Thinner line
+                pointRadius: 3, // Smaller points
+                pointHoverRadius: 5
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            elements: { line: { tension: 0.1 } }, // Slight curve
+            scales: {
+                r: {
+                    angleLines: { color: 'rgba(0, 0, 0, 0.08)' },
+                    grid: { color: 'rgba(0, 0, 0, 0.08)' },
+                    pointLabels: { font: { size: 9 } },
+                    ticks: { display: true, stepSize: 0.2, backdropPadding: 0, font: { size: 8 } },
+                    min: 0,
+                    max: 1
+                }
+            },
+             plugins: {
+                legend: { display: false },
+                 tooltip: {
+                     callbacks: {
+                         label: function(context) {
+                             const idx = context.dataIndex;
+                             const metricKey = radarMetricKeys[idx]; // Get original key
+                             const originalValue = metrics[metricKey]; // Get original value
+                             const label = context.chart.data.labels[idx]; // Get formatted label
+                             return `${label}: ${originalValue.toFixed(4)} (Norm: ${context.formattedValue})`;
+                         }
+                     }
+                 }
+            }
+        }
+    });
+}
+
+// --- Aggregate Metrics Plotting ---
+function destroyCharts() {
+    Object.values(chartInstances).forEach(chart => {
+         if(chart && typeof chart.destroy === 'function') {
+            chart.destroy();
+         }
+    });
+    chartInstances = {};
+}
+
+function plotAggregateMetrics(resultsData) {
+    summaryPlotsContainer.innerHTML = ''; // Clear previous
+    // Note: We don't destroy individual radar charts here, only aggregate ones.
+    // Destroy only the aggregate charts by checking keys or using a separate dictionary.
+     const aggKeys = Object.keys(chartInstances).filter(k => k.startsWith('agg_'));
+     aggKeys.forEach(key => {
+         if(chartInstances[key] && typeof chartInstances[key].destroy === 'function') {
+             chartInstances[key].destroy();
+             delete chartInstances[key];
+         }
+     });
+
+
+    if (resultsData.length === 0) {
+        summaryPlotsContainer.innerHTML = '<p>No data to plot.</p>';
+        return;
+    }
+
+    const chartType = aggregateChartTypeSelect.value;
+    summaryPlotsContainer.className = ''; // Reset class
+
+    if (chartType === 'bar_mean_stddev') {
+        summaryPlotsContainer.classList.add('bar-view');
+        plotMeanStdDevBars(resultsData);
+    } else if (chartType === 'scatter') {
+        summaryPlotsContainer.classList.add('scatter-view');
+        plotScatter(resultsData);
+    }
+}
+
+function plotMeanStdDevBars(resultsData) {
+     const labels = resultsData.map(r => r.id.substring(0, 16) + (r.id.length > 16 ? '...' : ''));
+     const metricsToPlot = ['mean', 'variance', 'entropy', 'skewness', 'kurtosis',
+        // Haralick
+        'homogeneity', 'contrast', 'correlation', 'energy', 'dissimilarity', 'asm',
+        // Hu (First few might be most informative)
+        'hu0', 'hu1', 'hu2', 'hu3', 'fractalDimension'
+    ];
+     metricsToPlot.forEach(metricKey => {
+        if (resultsData[0].metrics.hasOwnProperty(metricKey)) {
+            const values = resultsData.map(r => r.metrics[metricKey]).filter(v => isFinite(v)); // Filter out non-finite values
+            if (values.length === 0) return; // Skip if no valid values
+
+            const meanVal = values.reduce((a, b) => a + b, 0) / values.length;
+            const stdDev = Math.sqrt(values.map(x => (x - meanVal) ** 2).reduce((a, b) => a + b, 0) / values.length);
+
+            const chartContainer = document.createElement('div'); chartContainer.classList.add('chart-container');
+            const canvas = document.createElement('canvas'); chartContainer.appendChild(canvas);
+            summaryPlotsContainer.appendChild(chartContainer);
+
+            const ctx = canvas.getContext('2d');
+            const chartKey = `agg_bar_${metricKey}`;
+            chartInstances[chartKey] = new Chart(ctx, { /* ... bar chart config ... */
+                 type: 'bar',
+                 data: { labels: labels, datasets: [{ label: metricKey.charAt(0).toUpperCase() + metricKey.slice(1), data: values, backgroundColor: 'rgba(52, 152, 219, 0.6)', borderColor: 'rgba(52, 152, 219, 1)', borderWidth: 1 }] },
+                 options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false }, title: { display: true, text: `${metricKey.charAt(0).toUpperCase() + metricKey.slice(1)} (Mean: ${meanVal.toFixed(4)} ± ${stdDev.toFixed(4)})`, font: { size: 13 } } }, scales: { y: { beginAtZero: true, ticks: { font: { size: 10 }} }, x: { ticks: { font: { size: 10 } } } } }
+             });
+        }
+    });
+     if (summaryPlotsContainer.childElementCount === 0) { // Check if any charts were actually added
+          summaryPlotsContainer.innerHTML = '<p>No data available for selected metrics.</p>';
+     }
+}
+
+function plotScatter(resultsData) {
+    // Color mapping using a simple hash function for variety if many classes
+    const stringToColor = (str) => {
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+            hash = str.charCodeAt(i) + ((hash << 5) - hash);
+        }
+        const color = (hash & 0x00FFFFFF).toString(16).toUpperCase();
+        return "#" + "00000".substring(0, 6 - color.length) + color;
+    };
+
+    const dataPoints = resultsData.map(r => {
+        const classification = r.classification.label;
+        const isValidClass = classification !== 'N/A' && classification !== 'Labels missing' && classification !== 'Inference Error';
+        return {
+            x: r.metrics.mean,
+            y: r.metrics.entropy,
+            label: r.id.substring(0, 16) + (r.id.length > 16 ? '...' : ''),
+            classification: classification,
+            color: isValidClass ? stringToColor(classification) : '#cccccc' // Assign color
+        };
+    });
+
+    const pointColors = dataPoints.map(p => p.color);
+
+    const chartContainer = document.createElement('div'); chartContainer.classList.add('chart-container');
+    const canvas = document.createElement('canvas'); chartContainer.appendChild(canvas);
+    summaryPlotsContainer.appendChild(chartContainer);
+
+     const ctx = canvas.getContext('2d');
+     const chartKey = 'agg_scatter_mean_entropy';
+     chartInstances[chartKey] = new Chart(ctx, { /* ... scatter chart config ... */
+        type: 'scatter',
+        data: { datasets: [{ label: 'Sequences', data: dataPoints, backgroundColor: pointColors, pointRadius: 5, pointHoverRadius: 7 }] },
+        options: { responsive: true, maintainAspectRatio: false, scales: { x: { title: { display: true, text: 'Mean Frequency' }, ticks: { font: { size: 10 } } }, y: { title: { display: true, text: 'Shannon Entropy' }, ticks: { font: { size: 10 } } } },
+            plugins: { legend: { display: false }, title: { display: true, text: 'Mean Frequency vs. Shannon Entropy', font: { size: 14 } },
+                tooltip: { callbacks: { label: function(context) { const point = context.raw; return `${point.label}: (Mean: ${point.x.toFixed(4)}, Entropy: ${point.y.toFixed(4)}) Class: ${point.classification}`; } } }
+            } }
+     });
+}
+
+
+// --- Tab Switching Logic ---
+function openTab(event, tabName) {
+    const tabcontent = document.getElementsByClassName("tab-content");
+    for (let i = 0; i < tabcontent.length; i++) {
+        tabcontent[i].style.display = "none";
+        tabcontent[i].classList.remove("active-content");
+    }
+    const tabbuttons = document.getElementsByClassName("tab-button");
+    for (let i = 0; i < tabbuttons.length; i++) {
+        tabbuttons[i].classList.remove("active");
+    }
+    const currentTab = document.getElementById(tabName);
+    if (currentTab) {
+        currentTab.style.display = "block";
+        currentTab.classList.add("active-content");
+    }
+    if (event && event.currentTarget) {
+        event.currentTarget.classList.add("active");
+    }
+
+    // Re-render aggregate plots if switching to that tab
+    if (tabName === 'tab-aggregate') {
+         plotAggregateMetrics(aggregateMetricsData);
+    }
+}
+
+// --- Initialization ---
+document.addEventListener('DOMContentLoaded', () => {
+    pasteArea.style.display = 'block';
+    uploadArea.style.display = 'none';
+    urlArea.style.display = 'none';
+    examplesArea.style.display = 'none';
+    fileNameDisplay.textContent = 'No file chosen';
+    // Activate the first tab by default
+    openTab(null, 'tab-sequences'); // Pass null for event initially
+    document.querySelector('.tab-button[onclick*="tab-sequences"]').classList.add('active');
+
+    initializeWorker();
+
+    console.log("Advanced FCGR Analyzer Web App Initialized");
+});
