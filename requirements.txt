@@ -1,0 +1,16 @@
+biopython
+requests
+urllib3
+numpy
+pandas
+scipy
+opencv-python-headless # Use headless for servers/testing
+numba
+scikit-image
+tensorflow>=2.8 # Or tensorflow-cpu
+scikit-learn
+matplotlib
+seaborn
+joblib
+pytest
+pytest-mock
