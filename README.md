@@ -3,6 +3,7 @@
 ## Overview
 fcgrseq is a comprehensive bioinformatics tool for analyzing genomic sequences using Frequency Chaos Game Representation (FCGR). This pipeline performs sequence processing, feature extraction, statistical analysis, and machine learning classification to study sequence characteristics across different species and biotypes by way of their image fingerprint. A basic CNN is also run on the images themselves for species/biotype classification.
 
+A live demo of what FCGR images look like and how they are fingerprinted is available [here](https://baudrly.github.io/fcgrseq).
 
 ## Key Features
 
