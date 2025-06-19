@@ -612,7 +612,7 @@ def run_pipeline(output_dir: Optional[str],
                         
                         # Also for biotype if enough samples per class
                         biotype_counts = df['biotype'].value_counts()
-                        if biotype_counts.min() >= 5:
+                        if biotype_counts.min() >= 3:
                             rf_biotype = RandomForestClassifier(
                                 n_estimators=100, 
                                 random_state=cfg.RANDOM_STATE,
@@ -620,13 +620,13 @@ def run_pipeline(output_dir: Optional[str],
                             )
                             rf_biotype.fit(X_features, df['biotype'])
                             
-                        importance_plot_bt = an.plot_feature_importance(
-                            feature_cols, 
-                            rf_biotype.feature_importances_,
-                            title="Feature Importances - Biotype Classification (Random Forest)",
-                            figures_dir=figures_dir,
-                            output_format=plot_output_format,
-                            top_n=min(20, len(feature_cols))
+                            importance_plot_bt = an.plot_feature_importance(
+                                feature_cols, 
+                                rf_biotype.feature_importances_,
+                                title="Feature Importances - Biotype Classification (Random Forest)",
+                                figures_dir=figures_dir,
+                                output_format=plot_output_format,
+                                top_n=min(20, len(feature_cols))
                         )
                         if importance_plot_bt:
                             results_summary['feature_analysis'][f'rf_importance_biotype{plot_key_suffix}'] = importance_plot_bt
