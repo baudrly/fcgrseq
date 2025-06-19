@@ -62,7 +62,7 @@ A live demo of what FCGR images look like and how they are fingerprinted is avai
     umap-learn (optional for UMAP)
     ```
 
-    *Note: `requirements.txt` lists necessary packages including `tensorflow`. You might want `tensorflow-cpu` if you don't have a compatible GPU.*
+    *Note: `requirements.txt` lists necessary packages including `tensorflow`. You might want `tensorflow-cpu` if you don't have a compatible GPU. Note that without a GPU, the machine learning part will be very slow.*
 
 4.  **(Optional) Install Pandoc and LaTeX:** For PDF report generation, you need to install Pandoc ([https://pandoc.org/installing.html](https://pandoc.org/installing.html)) and a LaTeX distribution (e.g., TeX Live, MiKTeX). Ensure `pandoc` is in your system's PATH.
 
@@ -99,8 +99,10 @@ The pipeline generates:
 
 ## Usage
 
+Run this in the parent directory containing the `fcgrseq` directory (after cloning):
+
 ```bash
-python -m fcgr_analyzer.cli [-h] [-t TARGETS_FILE] [-i INPUT_FASTA] [-o OUTPUT_DIR] 
+python3 -m fcgrseq.cli [-h] [-t TARGETS_FILE] [-i INPUT_FASTA] [-o OUTPUT_DIR] 
                            [--config-file CONFIG_FILE] [--log-level {DEBUG,INFO,WARNING,ERROR,CRITICAL}]
 ```
 
